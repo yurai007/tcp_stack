@@ -105,6 +105,7 @@ public:
                     // SYN(x) + send
                     current_states[id] = state::SYN_SENT;
                     uint32_t seq_number = rand() % UINT32_MAX;
+                    seq_numbers_cached[id] = seq_number;
                     return make_handshake_segment(true, false, seq_number, boost::none);
                 }
             return boost::none;
@@ -132,12 +133,20 @@ public:
             // wait for SYN+ACK
             if (recv_segment != boost::none)
             {
-                if ((recv_segment->syn & 1) && (recv_segment->ack & 1)) //OK?
+                if ((recv_segment->syn & 1) && (recv_segment->ack & 1))
                 {
                     current_states[id] = state::ESTABLISHED;
-                    uint32_t seq_number = recv_segment->ack;
+                    uint32_t seq_number = recv_segment->ack_number;
                     uint32_t ack_number = recv_segment->seq_number + 1;
                     return make_handshake_segment(false, true, seq_number, ack_number);
+                }
+                else
+                if (recv_segment->syn & 1)
+                {
+                    current_states[id] = state::SYN_RCVD;
+                    uint32_t seq_number = seq_numbers_cached[id];
+                    uint32_t ack_number = recv_segment->seq_number + 1;
+                    return make_handshake_segment(true, true, seq_number, ack_number);
                 }
             }
             return boost::none;
@@ -148,7 +157,7 @@ public:
             // wait for ACK
             if (recv_segment != boost::none)
             {
-                if (recv_segment->ack & 1) //OK?
+                if (recv_segment->ack & 1)
                 {
                     current_states[id] = state::ESTABLISHED;
                     return boost::none;
@@ -252,7 +261,47 @@ static void three_way_handshake__ok_scenario1()
 
 static void three_way_handshake__ok_scenario2()
 {
+    tcp::tcp_manager manager1(1), manager2(1);
+    manager1.set_socket(0);
+    manager2.set_socket(0);
+    assert(manager1.get_state() == tcp::state::CLOSED);
+    assert(manager2.get_state() == tcp::state::CLOSED);
 
+    // SYN(x)
+    auto segment = manager1.handle_state({false, true}, boost::none);
+    assert(manager1.get_state() == tcp::state::SYN_SENT);
+    assert((segment->syn & 1) == 1 && (segment->ack & 1) == 0);
+
+    auto syn_segment1 = segment;
+
+    // SYN(y)
+    segment = manager2.handle_state({false, true}, boost::none);
+    assert(manager2.get_state() == tcp::state::SYN_SENT);
+    assert((segment->syn & 1) == 1 && (segment->ack & 1) == 0);
+
+    // send SYN+ACK(y,x+1) to manager2
+    segment = manager1.handle_state({}, segment);
+    assert(manager1.get_state() == tcp::state::SYN_RCVD);
+    assert((segment->syn & 1) == 1 && (segment->ack & 1) == 1);
+
+    auto syn_ack_segment1 = segment;
+
+    // send SYN+ACK(y,x+1) to manager1
+    segment = manager2.handle_state({}, syn_segment1);
+    assert(manager2.get_state() == tcp::state::SYN_RCVD);
+    assert((segment->syn & 1) == 1 && (segment->ack & 1) == 1);
+
+    // recv SYN+ACK(y,x+1)
+    segment = manager1.handle_state({}, segment);
+    assert(manager1.get_state() == tcp::state::ESTABLISHED);
+    assert(segment == boost::none);
+
+    // recv SYN+ACK(y,x+1)
+    segment = manager2.handle_state({}, syn_ack_segment1);
+    assert(manager2.get_state() == tcp::state::ESTABLISHED);
+    assert(segment == boost::none);
+
+    std::cout << "OK. " << __PRETTY_FUNCTION__ << " passed.\n";
 }
 
 static void three_way_handshake__nok_scenario()
@@ -291,6 +340,7 @@ int main()
     unit_tests::preliminaries();
     unit_tests::make_handshake_segment();
     unit_tests::three_way_handshake__ok_scenario1();
-    unit_tests::three_way_handshake__ok_scenario_benchmark();
+    unit_tests::three_way_handshake__ok_scenario2();
+    //unit_tests::three_way_handshake__ok_scenario_benchmark();
     return 0;
 }
