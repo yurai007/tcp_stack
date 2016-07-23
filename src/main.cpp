@@ -15,11 +15,11 @@
 
 // TO DO2: OK Scenario 2
 
-// TO DO3: move semantics for make_handshake_segment?
+// TO DO3: move semantics for make_three_way_handshake_segment?
 
 /*
  * Thanks to Assertion `this->is_initialized()' in boost::optional I managed to fix stupid bug in
-         make_handshake_segment. Experimental::optional doesn't have such assertion :(
+         make_three_way_handshake_segment. Experimental::optional doesn't have such assertion :(
  */
 
 namespace tcp
@@ -68,7 +68,11 @@ private:
 struct triggers
 {
     bool listen;
-    bool connect;
+    union
+    {
+        bool connect;
+        bool close;
+    };
 };
 
 class tcp_manager
@@ -106,7 +110,7 @@ public:
                     current_states[id] = state::SYN_SENT;
                     uint32_t seq_number = rand() % UINT32_MAX;
                     seq_numbers_cached[id] = seq_number;
-                    return make_handshake_segment(true, false, seq_number, boost::none);
+                    return make_three_way_handshake_segment(true, false, seq_number, boost::none);
                 }
             return boost::none;
         }
@@ -122,7 +126,7 @@ public:
                     seq_numbers_cached[id] = recv_segment->seq_number;
                     uint32_t seq_number = rand() % UINT32_MAX;
                     uint32_t ack_number = seq_numbers_cached[id] + 1;
-                    return make_handshake_segment(true, true, seq_number, ack_number);
+                    return make_three_way_handshake_segment(true, true, seq_number, ack_number);
                 }
             }
             return boost::none;
@@ -138,7 +142,7 @@ public:
                     current_states[id] = state::ESTABLISHED;
                     uint32_t seq_number = recv_segment->ack_number;
                     uint32_t ack_number = recv_segment->seq_number + 1;
-                    return make_handshake_segment(false, true, seq_number, ack_number);
+                    return make_three_way_handshake_segment(false, true, seq_number, ack_number);
                 }
                 else
                 if (recv_segment->syn & 1)
@@ -146,7 +150,7 @@ public:
                     current_states[id] = state::SYN_RCVD;
                     uint32_t seq_number = seq_numbers_cached[id];
                     uint32_t ack_number = recv_segment->seq_number + 1;
-                    return make_handshake_segment(true, true, seq_number, ack_number);
+                    return make_three_way_handshake_segment(true, true, seq_number, ack_number);
                 }
             }
             return boost::none;
@@ -166,11 +170,86 @@ public:
             return boost::none;
         }
         else
+        if (current_states[id] == state::ESTABLISHED)
+        {
+            if (initial_triggers.close)
+            {
+                current_states[id] = state::FIN_WAIT1;
+                return make_four_way_handshake_segment(true, false);
+            }
+            else
+                if (recv_segment != boost::none)
+                {
+                    if (recv_segment->fin & 1)
+                    {
+                        current_states[id] = state::CLOSE_WAIT;
+                        return make_four_way_handshake_segment(false, true);
+                    }
+                }
+            return boost::none;
+        }
+        else
+        if (current_states[id] == state::FIN_WAIT1)
+        {
+            if (recv_segment != boost::none)
+            {
+                if (recv_segment->ack & 1)
+                {
+                    current_states[id] = state::FIN_WAIT2;
+                    return boost::none;
+                }
+            }
+            return boost::none;
+        }
+        else
+        if (current_states[id] == state::FIN_WAIT2)
+        {
+            if (recv_segment != boost::none)
+            {
+                if (recv_segment->fin & 1)
+                {
+                    current_states[id] = state::TIMED_WAIT;
+                    return make_four_way_handshake_segment(false, true);
+                }
+            }
+            return boost::none;
+        }
+        else
+        if (current_states[id] == state::CLOSE_WAIT)
+        {
+            if (initial_triggers.close)
+            {
+                current_states[id] = state::LAST_ACK;
+                return make_four_way_handshake_segment(true, false);
+            }
+            return boost::none;
+        }
+        else
+        if (current_states[id] == state::LAST_ACK)
+        {
+            if (recv_segment != boost::none)
+            {
+                if (recv_segment->ack & 1)
+                {
+                    current_states[id] = state::CLOSED;
+                    return boost::none;
+                }
+            }
+            return boost::none;
+        }
+        else
+        if (current_states[id] == state::TIMED_WAIT)
+        {
+            current_states[id] = state::CLOSED;
+            return boost::none;
+        }
+        else
         return boost::none;
     }
 
-    static packet make_handshake_segment(bool syn, bool ack, boost::optional<uint32_t> seq_number,
-                                         boost::optional<uint32_t> ack_number)
+    static packet make_three_way_handshake_segment(bool syn, bool ack,
+                                                   boost::optional<uint32_t> seq_number,
+                                                   boost::optional<uint32_t> ack_number)
     {
         packet temp_segment;
         temp_segment.syn = static_cast<uint8_t>(syn);
@@ -179,6 +258,14 @@ public:
             temp_segment.seq_number = *seq_number;
         if (ack_number)
             temp_segment.ack_number = *ack_number;
+        return temp_segment;
+    }
+
+    static packet make_four_way_handshake_segment(bool fin, bool ack)
+    {
+        packet temp_segment;
+        temp_segment.fin = static_cast<uint8_t>(fin);
+        temp_segment.ack = static_cast<uint8_t>(ack);
         return temp_segment;
     }
 
@@ -213,15 +300,15 @@ static void preliminaries()
     std::cout << "OK. " << __PRETTY_FUNCTION__ << " passed.\n";
 }
 
-static void make_handshake_segment()
+static void make_three_way_handshake_segment()
 {
-    auto segment = tcp::tcp_manager::make_handshake_segment(false, false, boost::none, boost::none);
+    auto segment = tcp::tcp_manager::make_three_way_handshake_segment(false, false, boost::none, boost::none);
     assert((segment.syn & 1) == 0 && (segment.ack & 1) == 0);
 
-    segment = tcp::tcp_manager::make_handshake_segment(true, true, boost::none, boost::none);
+    segment = tcp::tcp_manager::make_three_way_handshake_segment(true, true, boost::none, boost::none);
     assert((segment.syn & 1) == 1 && (segment.ack & 1) == 1);
 
-    segment = tcp::tcp_manager::make_handshake_segment(true, true, 123, 321);
+    segment = tcp::tcp_manager::make_three_way_handshake_segment(true, true, 123, 321);
     assert((segment.syn & 1) == 1 && (segment.ack & 1) == 1);
     assert(segment.seq_number == 123 && segment.ack_number == 321);
 
@@ -309,6 +396,53 @@ static void three_way_handshake__nok_scenario()
 
 }
 
+static void four_way_handshake__ok_scenario()
+{
+    tcp::tcp_manager manager1(1), manager2(1);
+    manager1.set_socket(0);
+    manager2.set_socket(0);
+    assert(manager1.get_state() == tcp::state::CLOSED);
+    assert(manager2.get_state() == tcp::state::CLOSED);
+
+    // TO DO: In this moment I need ESTABLISHED on both sides
+    assert(manager1.get_state() == tcp::state::ESTABLISHED);
+    assert(manager2.get_state() == tcp::state::ESTABLISHED);
+
+    // send FIN
+    auto segment = manager1.handle_state({false, true}, boost::none);
+    assert(manager1.get_state() == tcp::state::FIN_WAIT1);
+    assert((segment->fin & 1) == 1);
+
+    // recv FIN, send ACK
+    segment = manager2.handle_state({}, segment);
+    assert(manager2.get_state() == tcp::state::CLOSE_WAIT);
+    assert((segment->ack & 1) == 1);
+
+    // recv ACK
+    segment = manager1.handle_state({}, segment);
+    assert(manager1.get_state() == tcp::state::FIN_WAIT2);
+    assert(segment == boost::none);
+
+    // send FIN
+    segment = manager2.handle_state({false, true}, boost::none);
+    assert(manager2.get_state() == tcp::state::LAST_ACK);
+    assert((segment->fin & 1) == 1);
+
+    // recv FIN, send ACK
+    segment = manager1.handle_state({}, segment);
+    assert(manager1.get_state() == tcp::state::TIMED_WAIT);
+    assert((segment->ack & 1) == 1);
+
+    // recv ACK
+    segment = manager2.handle_state({}, segment);
+    assert(manager2.get_state() == tcp::state::CLOSED);
+    assert(segment == boost::none);
+
+    segment = manager1.handle_state({}, boost::none);
+    assert(manager1.get_state() == tcp::state::CLOSED);
+    assert(segment == boost::none);
+}
+
 static void three_way_handshake__ok_scenario_benchmark()
 {
     // ~90 CPU cycles per handshake
@@ -338,9 +472,11 @@ static void three_way_handshake__ok_scenario_benchmark()
 int main()
 {
     unit_tests::preliminaries();
-    unit_tests::make_handshake_segment();
+    unit_tests::make_three_way_handshake_segment();
     unit_tests::three_way_handshake__ok_scenario1();
     unit_tests::three_way_handshake__ok_scenario2();
+    unit_tests::three_way_handshake__nok_scenario();
+    unit_tests::four_way_handshake__ok_scenario();
     //unit_tests::three_way_handshake__ok_scenario_benchmark();
     return 0;
 }
