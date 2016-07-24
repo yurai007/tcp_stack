@@ -1,5 +1,6 @@
 #include <iostream>
 #include <memory>
+#include <tuple>
 #include <vector>
 #include <array>
 #include <cassert>
@@ -8,19 +9,28 @@
 #include <boost/program_options.hpp>
 #include <boost/optional.hpp>
 
-
-// TO DO1: http://www.firewall.cx/networking-topics/protocols/tcp/138-tcp-options.html
-// attribute packed in [] ?, likely/unlikely
-// what for derivation like enum class tcp_state : uint16_t {} ?
-
-// TO DO2: OK Scenario 2
-
-// TO DO3: move semantics for make_three_way_handshake_segment?
+// Likely/unlikely for better speed?
+// TO DO: move semantics for make_three_way_handshake_segment?
 
 /*
+ * Inheritance for enum class if we dont wana default size which is 4B. E.g for option_kind I need
+   only 1B.
+
+ * __attribute__((packed) if I wana timestamps size to have 10B. Without there is 12B.
+   Unfortunately there is no standard [[packed]]. Maybe because it's dangerous on some
+   archs? ref: http://stackoverflow.com/questions/8568432/is-gccs-attribute-packed-pragma-pack-unsafe
+
+ * nice trick with sizeof(*this) :)
+
  * Thanks to Assertion `this->is_initialized()' in boost::optional I managed to fix stupid bug in
          make_three_way_handshake_segment. Experimental::optional doesn't have such assertion :(
- */
+
+ * if (x = y) is bad and compiler wanrns about it. Sth like x == y; is bad too and fortunately
+   there are warnings for this too :)
+
+ * Options impl based on seastar tcp.hh and
+   http://www.firewall.cx/networking-topics/protocols/tcp/138-tcp-options.html
+*/
 
 namespace tcp
 {
@@ -29,6 +39,11 @@ enum class state
 {
     CLOSED, LISTEN, SYN_RCVD, SYN_SENT, ESTABLISHED,
     FIN_WAIT1, FIN_WAIT2, TIMED_WAIT, CLOSING, CLOSE_WAIT, LAST_ACK
+};
+
+enum class option_kind : uint8_t
+{
+    EOL = 0, NOP = 1, MSS = 2, WIN_SCALE = 3, SACK = 4, TIMESTAMPS = 8
 };
 
 constexpr unsigned minimum_tcp_header_size = 20;
@@ -52,8 +67,34 @@ struct packet
     uint8_t syn : 1;
     uint8_t fin : 1;
     uint16_t window_size, checksum, urg_ptr;
-    //std::array<uint8_t, tcp_payload_size> payload;
 };
+
+template<class T, option_kind init>
+struct tcp_option
+{
+    option_kind kind {init};
+    uint8_t length {sizeof(*this)};
+    T data;
+} __attribute__((packed));
+
+template<option_kind init>
+struct tcp_option<void, init>
+{
+    option_kind kind {init};
+    uint8_t length {sizeof(*this)};
+} __attribute__((packed));
+
+struct timestamp
+{
+    uint32_t t1, t2;
+};
+
+using mss = tcp_option<uint16_t, option_kind::MSS>;
+using win_scale = tcp_option<uint8_t, option_kind::WIN_SCALE>;
+using sack = tcp_option<void, option_kind::SACK>;
+using timestamps = tcp_option<timestamp, option_kind::TIMESTAMPS>;
+using nop = uint8_t;
+using eol = uint8_t;
 
 class ipv4_address
 {
@@ -297,6 +338,25 @@ static void preliminaries()
     static_assert(static_cast<int>(tcp::state::CLOSE_WAIT) == 9, "WTF: should be 9");
     static_assert(static_cast<int>(tcp::state::LAST_ACK) == 10, "WTF: should be 10");
 
+    static_assert(sizeof(tcp::mss) == 4, "WTF: should be 4");
+    tcp::mss mss;
+    assert(mss.kind == tcp::option_kind::MSS && mss.length == 4);
+
+    static_assert(sizeof(tcp::win_scale) == 3, "WTF: should be 3");
+    tcp::win_scale win_scale;
+    assert(win_scale.kind == tcp::option_kind::WIN_SCALE && win_scale.length == 3);
+
+    static_assert(sizeof(tcp::sack) == 2, "WTF: should be 2");
+    tcp::sack sack;
+    assert(sack.kind == tcp::option_kind::SACK && sack.length == 2);
+
+    static_assert(sizeof(tcp::timestamps) == 10, "WTF: should be 10");
+    tcp::timestamps timestamps;
+    assert(timestamps.kind == tcp::option_kind::TIMESTAMPS && timestamps.length == 10);
+
+    static_assert(sizeof(tcp::nop) == 1, "WTF: should be 1");
+    static_assert(sizeof(tcp::eol) == 1, "WTF: should be 1");
+
     std::cout << "OK. " << __PRETTY_FUNCTION__ << " passed.\n";
 }
 
@@ -315,7 +375,9 @@ static void make_three_way_handshake_segment()
     std::cout << "OK. " << __PRETTY_FUNCTION__ << " passed.\n";
 }
 
-static void three_way_handshake__ok_scenario1()
+using managers = std::tuple<tcp::tcp_manager, tcp::tcp_manager>;
+
+static managers trigger_three_way_handshake__ok_scenario1()
 {
     tcp::tcp_manager server_manager(1), client_manager(1);
     server_manager.set_socket(0);
@@ -342,11 +404,10 @@ static void three_way_handshake__ok_scenario1()
     segment = server_manager.handle_state({}, segment);
     assert(server_manager.get_state() == tcp::state::ESTABLISHED);
     assert(segment == boost::none);
-
-    std::cout << "OK. " << __PRETTY_FUNCTION__ << " passed.\n";
+    return {server_manager, client_manager};
 }
 
-static void three_way_handshake__ok_scenario2()
+static managers trigger_three_way_handshake__ok_scenario2()
 {
     tcp::tcp_manager manager1(1), manager2(1);
     manager1.set_socket(0);
@@ -388,6 +449,18 @@ static void three_way_handshake__ok_scenario2()
     assert(manager2.get_state() == tcp::state::ESTABLISHED);
     assert(segment == boost::none);
 
+    return {manager1, manager2};
+}
+
+static void three_way_handshake__ok_scenario1()
+{
+    trigger_three_way_handshake__ok_scenario1();
+    std::cout << "OK. " << __PRETTY_FUNCTION__ << " passed.\n";
+}
+
+static void three_way_handshake__ok_scenario2()
+{
+    trigger_three_way_handshake__ok_scenario2();
     std::cout << "OK. " << __PRETTY_FUNCTION__ << " passed.\n";
 }
 
@@ -398,13 +471,10 @@ static void three_way_handshake__nok_scenario()
 
 static void four_way_handshake__ok_scenario()
 {
-    tcp::tcp_manager manager1(1), manager2(1);
-    manager1.set_socket(0);
-    manager2.set_socket(0);
-    assert(manager1.get_state() == tcp::state::CLOSED);
-    assert(manager2.get_state() == tcp::state::CLOSED);
+    auto established_managers = trigger_three_way_handshake__ok_scenario1();
+    auto manager1 = std::get<0>(established_managers);
+    auto manager2 = std::get<0>(established_managers);
 
-    // TO DO: In this moment I need ESTABLISHED on both sides
     assert(manager1.get_state() == tcp::state::ESTABLISHED);
     assert(manager2.get_state() == tcp::state::ESTABLISHED);
 
@@ -441,6 +511,7 @@ static void four_way_handshake__ok_scenario()
     segment = manager1.handle_state({}, boost::none);
     assert(manager1.get_state() == tcp::state::CLOSED);
     assert(segment == boost::none);
+    std::cout << "OK. " << __PRETTY_FUNCTION__ << " passed.\n";
 }
 
 static void three_way_handshake__ok_scenario_benchmark()
@@ -477,6 +548,6 @@ int main()
     unit_tests::three_way_handshake__ok_scenario2();
     unit_tests::three_way_handshake__nok_scenario();
     unit_tests::four_way_handshake__ok_scenario();
-    //unit_tests::three_way_handshake__ok_scenario_benchmark();
+    unit_tests::three_way_handshake__ok_scenario_benchmark();
     return 0;
 }
