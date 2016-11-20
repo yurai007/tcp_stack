@@ -60,6 +60,9 @@
 
         -> control flow, window, timeouts, etc
 
+ * in recv_full_segment htons(ETHER_TYPE) is very important.
+   Without this protocol no frames will be recieved by program
+
  * TO DO:
     - trigger_three_way_handshake__ok_scenario1__posix_backend
     - make segment (at the beginning in tcp_manager because it's covered) and stuff from dummy_test move-able
@@ -645,6 +648,7 @@ public:
         destination_ip = std::get<1>(dst_endpoint);
         destination_port = std::get<2>(dst_endpoint);
         send_full_segment();
+        flush();
     }
 
     raw_packet get_packet()
@@ -670,8 +674,8 @@ public:
     tcp::packet *get_tcp_header()
     {
         // should be OK when network order = BE. Check what about strict aliasing here.
-        return (tcp::packet*) (packet.data() + sizeof(struct iphdr)
-                                                  + sizeof(struct ether_header));
+        return (tcp::packet*) (packet.data() + sizeof(iphdr)
+                                                  + sizeof(ether_header));
     }
 
 
@@ -683,6 +687,11 @@ private:
     mac source_mac, destination_mac;
     std::array<unsigned char, 4>  payload {'D', 'u', 'p', 'a'};
     constexpr static int interface_index = 2; // eth0 index
+
+    void flush()
+    {
+        packet = {};
+    }
 
     void fill_ethernet_header(unsigned char *dest_mac,
                                      unsigned char *src_mac)
@@ -762,7 +771,6 @@ private:
         assert(result == packet_size);
     }
 
-    // htons(ETHER_TYPE) is very important. Without this protocol no frames will be recieved by program
     void recv_full_segment()
     {
         constexpr uint16_t ETHER_TYPE = 0x0800;
@@ -773,7 +781,7 @@ private:
         assert(rc >= 0);
 
         unsigned frames_counter = 0;
-        struct tcphdr *tcp_header = NULL;
+        tcphdr *tcp_header = NULL;
         while (!(tcp_header && tcp_header->source == tcp_header->dest &&
                 tcp_header->source == htons(1024)))
         {
@@ -781,10 +789,10 @@ private:
             assert(numbytes > 0);
             frames_counter++;
 
-            if ((unsigned)numbytes >= sizeof(struct iphdr) + sizeof(struct ether_header))
+            if ((unsigned)numbytes >= sizeof(iphdr) + sizeof(ether_header))
             {
-                tcp_header = (struct tcphdr *) (packet.data() + sizeof(struct iphdr)
-                                                         + sizeof(struct ether_header));
+                tcp_header = (tcphdr *) (packet.data() + sizeof(iphdr)
+                                                         + sizeof(ether_header));
             }
         }
         close(sockfd);
@@ -827,7 +835,7 @@ static void basic_network_connection_test(char is_sender)
     assert(tcp_header->seq_number == htonl(12345));
     //assert((tcp_header->syn & 1) == 1);
     assert((tcp_header->ack & 1) == 0);
-    std::cout << "OK\n";
+    std::cout << "OK. " << __PRETTY_FUNCTION__ << " passed.\n";
 }
 
 static void trigger_three_way_handshake__ok_scenario1__posix_backend(bool server_side)
@@ -889,6 +897,7 @@ static void trigger_three_way_handshake__ok_scenario1__posix_backend(bool server
 
         ip_manager.send_packet(*segment, client_endpoint, server_endpoint);
     }
+    std::cout << "OK. " << __PRETTY_FUNCTION__ << " passed.\n";
 }
 
 }
