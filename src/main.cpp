@@ -1,3 +1,12 @@
+#include <arpa/inet.h>
+#include <linux/if_packet.h>
+#include <sys/socket.h>
+#include <netinet/ether.h>
+#include <linux/ip.h>
+#include <linux/udp.h>
+#include <linux/tcp.h>
+#include <net/if.h>
+
 #include <iostream>
 #include <memory>
 #include <tuple>
@@ -30,6 +39,35 @@
 
  * Options impl based on seastar tcp.hh and
    http://www.firewall.cx/networking-topics/protocols/tcp/138-tcp-options.html
+
+ * now there are:
+    - tcp_manager which is not owner of packet, it only takes packet from outside and
+      change its state
+    - ip_manger which is "packet generator" - send/recv packets and pass them to tcp_manager
+    - Main purpose - network_manager: it would be great to just send/recv stream of data
+        (even in only one connection):
+        -> init connection
+
+        -> segmentation
+        -> setting seq
+        -> send
+        -> recv
+        -> ack
+        -> checking seq + merging
+        -> maybe retransmission
+
+        -> close connection
+
+        -> control flow, window, timeouts, etc
+
+ * in recv_full_segment htons(ETHER_TYPE) is very important.
+   Without this protocol no frames will be recieved by program
+
+ * TO DO:
+    - trigger_three_way_handshake__ok_scenario1__posix_backend
+    - make segment (at the beginning in tcp_manager because it's covered) and stuff from dummy_test move-able
+    - stuff from dummy_test (like endpoints) should probably be moved to ip_manager (owner of
+      endpoints) and get by getter (const ref) if needed.
 */
 
 namespace tcp
@@ -56,8 +94,8 @@ struct packet
     uint16_t src_port, dst_port;
     uint32_t seq_number, ack_number;
     uint8_t offset : 4;
-    uint8_t reserved : 3;
-    uint8_t ns : 1;
+    uint8_t reserved_ns : 4;
+    //uint8_t ns : 1;
     uint8_t cwr : 1;
     uint8_t ece : 1;
     uint8_t urg : 1;
@@ -99,9 +137,34 @@ using eol = uint8_t;
 class ipv4_address
 {
 public:
+    ipv4_address() = default;
     ipv4_address(const std::string &address)
         : address_(address){}
+
+    uint32_t get_value() const
+    {
+        std::array<unsigned short, 4> octets;
+        unsigned i = 0;
+        for (unsigned j = 0; j < octets.size(); j++)
+            octets[j] = extract_number(i);
+
+        return ((octets[0] << 24) | (octets[1] << 16) | (octets[2] << 8) | octets[3]);
+    }
+
 private:
+
+    unsigned extract_number(unsigned &i) const
+    {
+        unsigned acc = 0;
+        while (i < address_.size() && address_[i] != '.')
+        {
+            acc = acc*10 + ((unsigned)(address_[i]) - 48);
+            i++;
+        }
+        i++;
+        return acc;
+    }
+
     std::string address_;
 };
 
@@ -357,6 +420,18 @@ static void preliminaries()
     static_assert(sizeof(tcp::nop) == 1, "WTF: should be 1");
     static_assert(sizeof(tcp::eol) == 1, "WTF: should be 1");
 
+    tcp::ipv4_address ip1{"192.168.0.101"};
+    assert(ip1.get_value() == ((192U << 24) | (168 << 16) | (0 << 8) | 101));
+    tcp::ipv4_address ip2{"192.168.0.102"};
+    assert(ip2.get_value() == ((192U << 24) | (168 << 16) | (0 << 8) | 102));
+    tcp::ipv4_address ip3{"127.0.0.1"};
+    assert(ip3.get_value() == ((127U << 24) | (0 << 16) | (0 << 8) | 1));
+    tcp::ipv4_address ip4{"0.0.0.0"};
+    assert(ip4.get_value() == ((0U << 24) | (0 << 16) | (0 << 8) | 0));
+    tcp::ipv4_address ip5{"255.255.255.255"};
+    assert(ip5.get_value() == ((255U << 24) | (255 << 16) | (255 << 8) | 255));
+
+
     std::cout << "OK. " << __PRETTY_FUNCTION__ << " passed.\n";
 }
 
@@ -540,7 +615,333 @@ static void three_way_handshake__ok_scenario_benchmark()
 
 }
 
-int main()
+
+namespace posix_transport
+{
+
+// TO DO1: prefer exceptions then error codes here
+// TO DO2: Zero copy + move semantics
+// TO DO3: In fill_tcp_header I need options for mss
+
+using mac = std::array<unsigned char, ETH_ALEN>;
+using endpoint = std::tuple<mac, tcp::ipv4_address, uint16_t>;
+
+class ip_manager
+{
+public:
+
+    constexpr static unsigned max_packet_size = 128;
+    using raw_packet = std::array<unsigned char, max_packet_size>;
+
+    ip_manager()
+    {
+        srand(time(nullptr));
+    }
+
+    void send_packet(tcp::packet &packet, const endpoint &src_endpoint, const endpoint &dst_endpoint)
+    {
+        source_mac = std::get<0>(src_endpoint);
+        source_ip = std::get<1>(src_endpoint);
+        source_port = std::get<2>(src_endpoint);
+
+        destination_mac = std::get<0>(dst_endpoint);
+        destination_ip = std::get<1>(dst_endpoint);
+        destination_port = std::get<2>(dst_endpoint);
+        send_full_segment();
+        flush();
+    }
+
+    raw_packet get_packet()
+    {
+        return packet;
+    }
+
+    void recv_packet(const endpoint &src_endpoint)
+    {
+        (void)src_endpoint;
+        recv_full_segment();
+    }
+
+    tcp::packet recv_tcp_packet(const endpoint &src_endpoint)
+    {
+        (void)src_endpoint;
+        recv_full_segment();
+        tcp::packet tcp_packet;
+        memcpy(&tcp_packet, get_tcp_header(), sizeof tcp_packet);
+        return tcp_packet;
+    }
+
+    tcp::packet *get_tcp_header()
+    {
+        // should be OK when network order = BE. Check what about strict aliasing here.
+        return (tcp::packet*) (packet.data() + sizeof(iphdr)
+                                                  + sizeof(ether_header));
+    }
+
+
+private:
+    tcp::ipv4_address source_ip, destination_ip;
+    uint16_t source_port, destination_port;
+    raw_packet packet;
+
+    mac source_mac, destination_mac;
+    std::array<unsigned char, 4>  payload {'D', 'u', 'p', 'a'};
+    constexpr static int interface_index = 2; // eth0 index
+
+    void flush()
+    {
+        packet = {};
+    }
+
+    void fill_ethernet_header(unsigned char *dest_mac,
+                                     unsigned char *src_mac)
+    {
+        ether_header *ethernet_header = (ether_header *) packet.data();
+        ethernet_header->ether_type = htons(ETH_P_IP);
+        memcpy(ethernet_header->ether_shost, (uint8_t *)src_mac, ETH_ALEN);
+        memcpy(ethernet_header->ether_dhost, (uint8_t *)dest_mac, ETH_ALEN);
+    }
+
+    void fill_ip_header__for_tcp(unsigned size)
+    {
+        iphdr *ip_header = (iphdr *) (packet.data() + sizeof(ether_header));
+        unsigned payload_size = size - sizeof(ether_header) - sizeof(iphdr)
+                - sizeof(tcphdr);
+        ip_header->daddr = htonl(destination_ip.get_value());
+        ip_header->frag_off = 0;
+        ip_header->check = 0; //0x67f9; // should I compute checksum or linux will do this?
+        ip_header->protocol = IPPROTO_TCP;
+        ip_header->saddr = htonl(source_ip.get_value());
+        ip_header->ttl = 64;
+        ip_header->tot_len = htons(payload_size + sizeof(iphdr) + sizeof(tcphdr));
+        ip_header->id = 12345;
+        ip_header->ihl = 5; //Minmal size is 5. IP header has options too, so this field is needed !
+        ip_header->tos = 0;
+        ip_header->version = 4; //ipv4
+    }
+
+    void fill_tcp_header()
+    {
+        tcphdr *tcp_header = (tcphdr *)((unsigned char *)packet.data()
+                                                      + sizeof(ether_header)
+                                                      + sizeof(iphdr));
+        tcp_header->source = htons(source_port);
+        tcp_header->dest = htons(destination_port);
+        tcp_header->seq = htonl(12345);
+        //tcp_header->ack_seq = 0;
+        tcp_header->syn = 1;
+        tcp_header->urg = 0;
+        tcp_header->doff = 5;
+    }
+
+    void fill_payload(unsigned char payload[4])
+    {
+        unsigned char *payload_ptr = ((unsigned char *)packet.data()
+                                                      + sizeof(ether_header)
+                                                      + sizeof(iphdr)
+                                                      + sizeof(tcphdr));
+        memcpy(payload_ptr, payload, 4);
+    }
+
+    void make_segment(int packet_size)
+    {
+        memset(packet.data(), 0, max_packet_size);
+
+        fill_ethernet_header(destination_mac.data(), source_mac.data());
+        fill_ip_header__for_tcp(packet_size);
+        fill_tcp_header();
+        fill_payload(payload.data());
+    }
+
+    void send_full_segment()
+    {
+        sockaddr_ll dest_address;
+        dest_address.sll_ifindex = interface_index;
+        dest_address.sll_halen = ETH_ALEN;
+        memcpy(dest_address.sll_addr, destination_mac.data(), ETH_ALEN);
+
+        int packet_size = 64;
+        make_segment(packet_size);
+
+        int sockfd = socket(AF_PACKET, SOCK_RAW, IPPROTO_RAW);
+        assert(sockfd > 2);
+
+        int result = sendto(sockfd, packet.data(), packet_size, 0, (sockaddr*)&dest_address,
+                   sizeof(sockaddr_ll));
+        assert(result == packet_size);
+    }
+
+    void recv_full_segment()
+    {
+        constexpr uint16_t ETHER_TYPE = 0x0800;
+        int sockfd = socket(AF_PACKET, SOCK_RAW, htons(ETHER_TYPE));
+        assert(sockfd > 2);
+
+        int rc = setsockopt(sockfd, SOL_SOCKET, SO_BINDTODEVICE, "eth0", IFNAMSIZ-1);
+        assert(rc >= 0);
+
+        unsigned frames_counter = 0;
+        tcphdr *tcp_header = NULL;
+        while (!(tcp_header && tcp_header->source == tcp_header->dest &&
+                tcp_header->source == htons(1024)))
+        {
+            int numbytes = recvfrom(sockfd, packet.data(), max_packet_size, 0, 0, 0);
+            assert(numbytes > 0);
+            frames_counter++;
+
+            if ((unsigned)numbytes >= sizeof(iphdr) + sizeof(ether_header))
+            {
+                tcp_header = (tcphdr *) (packet.data() + sizeof(iphdr)
+                                                         + sizeof(ether_header));
+            }
+        }
+        close(sockfd);
+        std::cout << __FUNCTION__ <<":  recieved " << frames_counter << " frames in total\n";
+    }
+
+};
+
+}
+
+namespace posix_transport_tests
+{
+
+// TO DO: Disabled tcp_header->syn checking.
+//        Fix problem with tcp_header->syn (tcp::packet vs tcphdr)!
+static void basic_network_connection_test(char is_sender)
+{
+    posix_transport::ip_manager ip_manager;
+    const posix_transport::mac dest_mac = {0x00, 0x1a, 0xa0, 0xb9, 0xd7, 0xad}; //eth0
+    const posix_transport::mac src_mac = {0x9c, 0xb6, 0x54, 0xa3, 0xd4, 0xc6}; //enp0s25
+    const tcp::ipv4_address dest_ip{"10.0.0.10"};
+    const tcp::ipv4_address src_ip{"10.0.0.20"};
+    constexpr uint16_t port = 1024;
+    const posix_transport::endpoint src_endpoint = {src_mac, src_ip, port};
+    const posix_transport::endpoint dst_endpoint = {dest_mac, dest_ip, port};
+    tcp::packet* tcp_header = nullptr;
+
+    // in this moment segments are hardcoded
+    tcp::packet segment;
+
+    if (is_sender == 'S')
+        ip_manager.send_packet(segment, src_endpoint, dst_endpoint);
+    else
+        ip_manager.recv_packet(dst_endpoint);
+
+    tcp_header = ip_manager.get_tcp_header();
+    assert(tcp_header->src_port == tcp_header->dst_port);
+    assert(tcp_header->src_port == htons(port));
+    // implicit (hardcoded in send)
+    assert(tcp_header->seq_number == htonl(12345));
+    //assert((tcp_header->syn & 1) == 1);
+    assert((tcp_header->ack & 1) == 0);
+    std::cout << "OK. " << __PRETTY_FUNCTION__ << " passed.\n";
+}
+
+static void trigger_three_way_handshake__ok_scenario1__posix_backend(bool server_side)
+{
+    posix_transport::ip_manager ip_manager;
+    const posix_transport::mac server_mac = {0x00, 0x1a, 0xa0, 0xb9, 0xd7, 0xad}; //eth0
+    const posix_transport::mac client_mac = {0x9c, 0xb6, 0x54, 0xa3, 0xd4, 0xc6}; //enp0s25
+    const tcp::ipv4_address server_ip{"10.0.0.10"};
+    const tcp::ipv4_address client_ip{"10.0.0.20"};
+    constexpr uint16_t port = 1024;
+    const posix_transport::endpoint client_endpoint = {client_mac, client_ip, port};
+    const posix_transport::endpoint server_endpoint = {server_mac, server_ip, port};
+
+    // optiplex
+    if (server_side)
+    {
+        tcp::tcp_manager server_manager(1);
+
+        server_manager.set_socket(0);
+        assert(server_manager.get_state() == tcp::state::CLOSED);
+
+        auto segment = server_manager.handle_state({true, false}, boost::none);
+        assert(server_manager.get_state() == tcp::state::LISTEN);
+        assert(segment == boost::none);
+
+        segment = ip_manager.recv_tcp_packet(client_endpoint);
+        assert((segment->syn & 1) == 1 && (segment->ack & 1) == 0);
+
+        segment = server_manager.handle_state({}, segment);
+        assert(server_manager.get_state() == tcp::state::SYN_RCVD);
+        assert((segment->syn & 1) == 1 && (segment->ack & 1) == 1);
+
+        ip_manager.send_packet(*segment, server_endpoint, client_endpoint);
+        segment = ip_manager.recv_tcp_packet(client_endpoint);
+        assert((segment->syn & 1) == 0 && (segment->ack & 1) == 1);
+
+        segment = server_manager.handle_state({}, segment);
+        assert(server_manager.get_state() == tcp::state::ESTABLISHED);
+        assert(segment == boost::none);
+    }
+    else
+    {
+        tcp::tcp_manager client_manager(1);
+
+        client_manager.set_socket(0);
+        assert(client_manager.get_state() == tcp::state::CLOSED);
+
+        auto segment = client_manager.handle_state({false, true}, boost::none);
+        assert(client_manager.get_state() == tcp::state::SYN_SENT);
+        assert((segment->syn & 1) == 1 && (segment->ack & 1) == 0);
+
+        ip_manager.send_packet(*segment, client_endpoint, server_endpoint);
+        segment = ip_manager.recv_tcp_packet(server_endpoint);
+        assert((segment->syn & 1) == 1 && (segment->ack & 1) == 1);
+
+        segment = client_manager.handle_state({}, segment);
+        assert(client_manager.get_state() == tcp::state::ESTABLISHED);
+        assert((segment->syn & 1) == 0 && (segment->ack & 1) == 1);
+
+        ip_manager.send_packet(*segment, client_endpoint, server_endpoint);
+    }
+    std::cout << "OK. " << __PRETTY_FUNCTION__ << " passed.\n";
+}
+
+}
+
+class network_manager
+{
+public:
+    network_manager(std::unique_ptr<posix_transport::ip_manager> ip_manager_,
+                    std::unique_ptr<tcp::tcp_manager> tcp_manager_)
+        : ip_manager(std::move(ip_manager_)), tcp_manager(std::move(tcp_manager_)) {}
+
+    template<class Buffer>
+    unsigned send_data(unsigned bytes, const Buffer &buffer)
+    {
+        try
+        {
+
+        }
+        catch (...)
+        {
+
+        }
+        return bytes;
+    }
+    template<class Buffer>
+    unsigned recv_data(const Buffer &buffer, unsigned max_size)
+    {
+        try
+        {
+
+        }
+        catch (...)
+        {
+
+        }
+        return max_size;
+    }
+private:
+    std::unique_ptr<posix_transport::ip_manager> ip_manager {nullptr};
+    std::unique_ptr<tcp::tcp_manager> tcp_manager {nullptr};
+};
+
+
+int main(int argc, char **argv)
 {
     unit_tests::preliminaries();
     unit_tests::make_three_way_handshake_segment();
@@ -548,6 +949,11 @@ int main()
     unit_tests::three_way_handshake__ok_scenario2();
     unit_tests::three_way_handshake__nok_scenario();
     unit_tests::four_way_handshake__ok_scenario();
-    unit_tests::three_way_handshake__ok_scenario_benchmark();
+
+    assert(argc == 2 && (argv[1][0] == 'S' || argv[1][0] == 'L'));
+    bool server_side = (argv[1][0] == 'S');
+    posix_transport_tests::basic_network_connection_test(argv[1][0]);
+    posix_transport_tests::trigger_three_way_handshake__ok_scenario1__posix_backend(server_side);
+
     return 0;
 }
